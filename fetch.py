@@ -132,19 +132,46 @@ def secid_of(code, market=None):
 
 
 # ---------- 取数 ----------
-def try_hosts(fn):
-    """在 HOSTS 上逐个试 fn(host)，返回第一个非空结果，同时记住成功的 host。"""
+def try_hosts(fn, prefer=None):
+    """在 HOSTS 上逐个试 fn(host)，返回第一个非空结果。
+       prefer 命中就先用它（探到的已知好主机），避免每个标的都重新枚举全部节点。
+       返回 (命中主机, 结果, 错误链)；即使全空也会回传"第一个响应成功的主机"，
+       便于区分【连不上】和【连上了但没数据】。"""
     errs = []
-    for host in HOSTS:
+    order = ([prefer] if prefer else []) + [h for h in HOSTS if h != prefer]
+    first_ok = None
+    for host in order:
         try:
             r = fn(host)
         except Exception as e:
             errs.append("%s:%s" % (host, str(e)[:70]))
             continue
+        if first_ok is None:
+            first_ok = host
         if r:
             return host, r, errs
         errs.append("%s:空" % host)
     return None, None, errs
+
+
+def pick_host(probe_secid, klt=1, timeout=12):
+    """用第一个标的做一次探针，定出整轮用哪台节点。
+       只有 push2delay 部署了分钟资金流，所以必须"逐-terminus 试到出数据为止"。"""
+    order, first_ok = [], None
+    for host in HOSTS:
+        try:
+            klines, _ = fflow(host, probe_secid, klt, timeout)
+        except Exception as e:
+            order.append("%s:err" % host)
+            continue
+        if first_ok is None:
+            first_ok = host
+        if klines:
+            log("探针命中 %s（分钟档 %d 行），本轮统一用它" % (host, len(klines)))
+            return host, order
+        order.append("%s:空" % host)
+    log("探针：没有节点返回分钟数据，本轮退化到逐个枚举")
+    return first_ok, order
 
 
 def fflow(host, secid, klt, timeout=20):
@@ -201,11 +228,15 @@ def main():
     for x in items_cfg:
         secid_map[x["code"]] = secid_of(x["code"], x.get("market"))
 
-    # 1) 先批量拿名称（任一台可达的节点都行）
+    # 1) 探针：整轮只用这一台节点（带 fallback）
+    probe_code = items_cfg[0]["code"] if items_cfg else "600667"
+    best, probe_trace = pick_host(secid_map.get(probe_code, secid_of(probe_code)))
+
+    # 2) 批量拿名称（任一台可达的节点都行）
     names = {}
     try:
         host_q, q, _ = try_hosts(
-            lambda h: quote(h, [secid_map[x["code"]] for x in items_cfg]))
+            lambda h: quote(h, [secid_map[x["code"]] for x in items_cfg]), prefer=best)
         if q:
             for x in items_cfg:
                 r = q.get(x["code"])
@@ -215,22 +246,28 @@ def main():
     except Exception as e:
         log("批量快照失败 %s" % str(e)[:80])
 
+    tz = datetime.timezone(datetime.timedelta(hours=8))
+    today = datetime.datetime.now(tz).strftime("%Y-%m-%d")
+
     items, errors = [], []
     ok_host = None
     for x in items_cfg:
         code = x["code"]
         sid = secid_map[code]
 
-        # 2) 分钟档
-        h1, kmin, e1 = try_hosts(lambda hh, s=sid: fflow(hh, s, 1)[0])
+        # 3) 分钟档
+        h1, kmin, e1 = try_hosts(lambda hh, s=sid: fflow(hh, s, 1)[0], prefer=best)
         rows = to_rows(kmin or [])
         if h1:
             ok_host = h1
 
-        # 3) 对照组：日线档（用来区分"非交易日"和"接口没数据"）
-        h2, kday, _ = try_hosts(lambda hh, s=sid: fflow(hh, s, 101)[0])
+        # 4) 对照组：日线档。★ 必须比对日期 —— 盘前跑的话返回的会是"上一交易日"，
+        #    只看"有没有数据"会把盘前误判成"盘中未生成"。
+        h2, kday, _ = try_hosts(lambda hh, s=sid: fflow(hh, s, 101)[0], prefer=best)
         day_rows = to_rows(kday or [])
         day_last = day_rows[-1][1] if day_rows else None
+        day_date = day_rows[-1][0].strip() if day_rows else None
+        day_is_today = (day_date == today)
 
         nm, price, pct = names.get(code, (None, None, None))
         if rows:
@@ -252,25 +289,34 @@ def main():
                 "slope5": slope(rows, 5),
                 "slope15": slope(rows, 15),
                 "day_main": day_last,
+                "day_date": day_date,
                 "rows": rows,
             })
         else:
+            # 归因分三种，如实标注，不猜、不补数据
+            if day_last is None:
+                why = "日线档也拉不到（节点全不可达，或该标的东财无此数据）"
+            elif not day_is_today:
+                why = "日线最新只有 %s，不是今天 %s → 非交易日或尚未开盘" % (day_date, today)
+            else:
+                why = "日线已是今天(%s)但分钟档空 → 盘中分钟数据未生成/接口异常" % day_date
             errors.append({
                 "code": code, "name": x.get("name"),
-                "secid": sid, "day_main": day_last,
-                "reason": "分钟档无数据" + ("（日线档有数据→盘中或未生成）"
-                                      if day_last is not None else "（日线档也无数据→大概率非交易日）"),
+                "secid": sid, "day_main": day_last, "day_date": day_date,
+                "day_is_today": day_is_today,
+                "reason": why,
                 "hosts_tried": e1,
             })
-        time.sleep(0.25)
+        time.sleep(0.2)
 
-    tz = datetime.timezone(datetime.timedelta(hours=8))
     now = datetime.datetime.now(tz)
     data = {
         "updated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
         "updated_iso": now.isoformat(),
-        "tz": "Asia/Shanghai(+08:00)",
+        "trade_date": today,
+        # 记录"连得上但没数据"的节点，跟"完全连不上"区分开
         "source_host": ok_host,
+        "probe_trace": probe_trace,
         "source_note": "东方财富 push2delay /api/qt/stock/fflow/kline/get?klt=1（当日累计，单位：元）",
         "symbol_count": len(items),
         "items": items,
