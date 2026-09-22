@@ -1,0 +1,64 @@
+name: fetch-fundflow-line
+
+on:
+  schedule:
+    # A股交易时段 09:30-15:00 CST = 01:30-07:00 UTC，周一到周五
+    # GitHub cron 粒度是分钟但不保证准点，实际会有几分钟漂移
+    - cron: "*/5 1,2,3,4,5,6 * * 1-5"
+    # 收盘后补一次，拿完整的当日分钟序列
+    - cron: "10 7 * * 1-5"
+    # 美股时段外做一次"非交易日自检"，便于页面显示兜底文案
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fundflow-line
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch minute fund flow
+        run: python fetch.py
+
+      - name: Show summary
+        run: |
+          python - <<'PY'
+          import json
+          d = json.load(open("docs/data.json", encoding="utf-8"))
+          print("updated_at  :", d.get("updated_at"))
+          print("source_host :", d.get("source_host"))
+          print("hit         :", d.get("symbol_count"), "/",
+                d.get("symbol_count", 0) + len(d.get("errors", [])))
+          for it in d.get("items", []):
+              print("  %-10s %-14s pts=%-4d main=%+.2f亿  day=%+.2f亿"
+                    % (it["code"], it.get("name") or "", it["points"],
+                       it["last"]["main"] / 1e8,
+                       (it.get("day_main") or 0) / 1e8))
+          for e in d.get("errors", []):
+              print("  ERR %-10s %s" % (e["code"], e.get("reason")))
+          PY
+
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/data.json
+          if git diff --quiet --cached; then
+            echo "数据无变化，跳过提交"
+          else
+            git commit -m "data: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            git pull --rebase --autostash origin main
+            git push origin main
+          fi
