@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>资金线 · A股分钟级资金流</title>
+<style>
+:root{
+  --bg:#f5f6f8; --card:#fff; --line:#e3e6ea; --tx:#1b1f24; --tx2:#5b6570; --tx3:#8a929b;
+  --up:#d0342c; --down:#0f9d58; --flat:#8a929b; --warn:#b7791f; --warnbg:#fff8e6;
+}
+@media (prefers-color-scheme:dark){
+  :root{ --bg:#14171a; --card:#1c2024; --line:#2c3136; --tx:#e6e9ec; --tx2:#9aa4ad; --tx3:#6b747d;
+         --up:#f0554d; --down:#2eb872; --flat:#6b747d; --warn:#e0b341; --warnbg:#2a2413; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);
+  font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  padding:12px;max-width:1100px;margin:0 auto;-webkit-text-size-adjust:100%}
+h1{font-size:17px;margin:0 0 2px}
+.sub{color:var(--tx2);font-size:12px;margin-bottom:10px}
+.bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:12px}
+.tag{font-size:11px;padding:2px 8px;border:1px solid var(--line);border-radius:20px;color:var(--tx2);background:var(--card)}
+.tag.ok{color:var(--down);border-color:color-mix(in srgb,var(--down) 40%,transparent)}
+.tag.late{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+.tag.bad{color:var(--up);border-color:color-mix(in srgb,var(--up) 40%,transparent)}
+button{font:inherit;font-size:12px;padding:5px 12px;border:1px solid var(--line);border-radius:6px;
+  background:var(--card);color:var(--tx);cursor:pointer}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+.chd{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.nm{font-weight:600;font-size:15px}
+.cd{color:var(--tx3);font-size:11px;font-variant-numeric:tabular-nums}
+.big{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.2;margin-top:6px}
+.u{font-size:11px;color:var(--tx3);font-weight:400;margin-left:3px}
+.up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--flat)}
+.row2{display:flex;gap:10px;margin-top:6px;font-size:11px;color:var(--tx2);flex-wrap:wrap}
+svg{display:block;width:100%;height:64px;margin-top:8px}
+table{width:100%;border-collapse:collapse;margin-top:8px;font-size:11px}
+td{padding:3px 0;border-top:1px solid var(--line);font-variant-numeric:tabular-nums}
+td.k{color:var(--tx2);width:52px} td.v{text-align:right;width:78px}
+td.b{width:auto;padding-left:8px}
+.bwrap{height:6px;background:var(--line);border-radius:3px;overflow:hidden}
+.bfill{height:100%;border-radius:3px}
+.note{background:var(--warnbg);border:1px solid color-mix(in srgb,var(--warn) 30%,transparent);
+  color:var(--tx);padding:10px 12px;border-radius:8px;font-size:12px;margin-bottom:12px}
+.hr{height:1px;background:var(--line);margin:14px 0 8px}
+.ft{color:var(--tx3);font-size:11px;margin-top:14px;line-height:1.7}
+pre.log{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px;
+  font-size:11px;color:var(--tx2);overflow:auto;max-height:200px;margin:0}
+</style>
+</head>
+<body>
+
+<h1>资金线 · A股分钟级资金流</h1>
+<div class="sub">东方财富 <code>fflow/kline/get?klt=1</code> —— 当日<b>累计</b>净额，每 5 分钟抓一次</div>
+
+<div class="bar" id="bar"></div>
+<div id="warn"></div>
+<div class="grid" id="grid"></div>
+
+<div class="hr"></div>
+<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
+  <b style="font-size:12px">抓取日志</b>
+  <button onclick="toggleLog()">显示/隐藏</button>
+</div>
+<pre class="log" id="logbox" style="display:none"></pre>
+
+<div class="ft" id="ft"></div>
+
+<script>
+const YI = 1e8;
+function yi(v){ return v==null ? '—' : (v/YI).toFixed(2); }
+function fmtYi(v){ return v==null ? '—' : (v>=0?'+':'') + (v/YI).toFixed(2); }
+function cls(v){ return v>0?'up':(v<0?'down':'flat'); }
+function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function sparkline(rows){
+  const n = rows.length;
+  if(n<2) return '';
+  const vals = rows.map(r=>r[1]);
+  // 同时纳入 0 轴，让"由负转正/由正转负"看得出来
+  let mn=Math.min(0,...vals), mx=Math.max(0,...vals);
+  if(mn===mx){ mn-=1; mx+=1; }
+  const W=300,H=64,PT=4,PB=4;
+  const x=i=> i/(n-1)*W;
+  const y=v=> PT + (mx-v)/(mx-mn)*(H-PT-PB);
+  const pts = vals.map((v,i)=> x(i).toFixed(1)+','+y(v).toFixed(1)).join(' ');
+  const zero = y(0).toFixed(1);
+  const last = vals[n-1];
+  const col = last>0 ? 'var(--up)' : (last<0 ? 'var(--down)' : 'var(--flat)');
+  const area = `0,${H} ${pts} ${W},${H}`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <line x1="0" y1="${zero}" x2="${W}" y2="${zero}" stroke="var(--line)" stroke-width="1" stroke-dasharray="3,3"/>
+    <polygon points="${area}" fill="${col}" opacity="0.12"/>
+    <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="1.6" stroke-linejoin="round"/>
+    <circle cx="${W}" cy="${y(last).toFixed(1)}" r="2.6" fill="${col}"/>
+  </svg>`;
+}
+
+function bars(last){
+  const arr=[['超大单',last.huge],['大单',last.big],['中单',last.mid],['小单',last.small]];
+  const mx = Math.max(...arr.map(a=>Math.abs(a[1])), 1);
+  return '<table>'+arr.map(([k,v])=>{
+    const c = cls(v);
+    return `<tr><td class="k">${k}</td><td class="v ${c}">${fmtYi(v)}亿</td>
+      <td class="b"><div class="bwrap"><div class="bfill" style="width:${Math.abs(v)/mx*100}%;background:var(--${v>0?'up':(v<0?'down':'flat')})"></div></div></td></tr>`;
+  }).join('')+'</table>';
+}
+
+function freshness(iso){
+  if(!iso) return {t:'无时间戳',c:'bad'};
+  const now=Date.now(), dt=(now-new Date(iso).getTime())/1000;
+  if(dt<180) return {t:'实时',c:'ok'};
+  if(dt<600) return {t:'延迟 '+Math.round(dt/60)+' 分钟',c:'late'};
+  if(dt<86400) return {t:'已停更 '+Math.round(dt/60)+' 分钟',c:'bad'};
+  return {t:'未更新',c:'bad'};
+}
+
+function render(d){
+  const f = freshness(d.updated_iso);
+  document.getElementById('bar').innerHTML = `
+    <span class="tag ${f.c}">● ${f.t}</span>
+    <span class="tag">更新 ${esc(d.updated_at||'—')}</span>
+    <span class="tag">节点 ${esc(d.source_host||'无')}</span>
+    <span class="tag">标的 ${d.symbol_count||0} / ${(d.items||[]).length+(d.errors||[]).length}</span>
+    <button onclick="location.reload()">刷新</button>`;
+
+  const items=d.items||[], errs=d.errors||[];
+  let warn='';
+  if(items.length===0 && errs.length>0){
+    const allNoDay = errs.every(e=>e.day_main==null);
+    warn = `<div class="note"><b>${allNoDay?'非交易日 / 尚未开盘':'★ 分钟档今天一片空白'}</b><br>
+      全部 ${errs.length} 个标的都没拿到分钟资金流。<br>
+      判别依据：${allNoDay?'连日线档(klt=101)也是空的 —— 说明今天没有交易数据。':'日线档(klt=101)有数据、分钟档(klt=1)没有 —— 说明是分钟数据本身未生成或接口异常，不是非交易日。'}<br>
+      <span style="color:var(--tx3)">这里不做任何补数据/估算，空就是空。</span></div>`;
+  } else if(errs.length>0){
+    warn = `<div class="note"><b>${errs.length} 个标的取不到</b><br>` +
+      errs.map(e=>`${esc(e.name||e.code)}：${esc(e.reason)}`).join('<br>') + '</div>';
+  }
+  document.getElementById('warn').innerHTML = warn;
+
+  document.getElementById('grid').innerHTML = items.map(it=>{
+    const origDate = (it.first||'').slice(0,10);
+    return `<div class="card">
+      <div class="chd"><span class="nm">${esc(it.name||it.code)}</span>
+        <span class="cd">${esc(it.code)}${it.price!=null?' · '+it.price+' · '+(it.pct>0?'+':'')+it.pct+'%':''}</span></div>
+      <div class="big ${cls(it.last.main)}">${fmtYi(it.last.main)}<span class="u">亿元</span></div>
+      <div class="row2">
+        <span>主力累计</span><span>${esc(it.first||'')} → ${esc(it.last_time||'')}</span>
+        <span>${it.points} 点</span></div>
+      ${sparkline(it.rows)}
+      <div class="row2">
+        <span>近5分钟斜率 ${it.slope5==null?'—':((it.slope5/YI).toFixed(3)+'亿/分')}</span>
+        <span>近15分钟 ${it.slope15==null?'—':((it.slope15/YI).toFixed(3)+'亿/分')}</span></div>
+      ${bars(it.last)}
+      <div class="row2" style="color:var(--tx3)">日线主力 ${fmtYi(it.day_main)}亿 · 数据日 ${esc(origDate)} · 口径 当日累计</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('logbox').textContent = (d.log||[]).join('\n');
+  document.getElementById('ft').innerHTML =
+    `口径：东财 <code>fflow/kline/get?klt=1</code>，主力/超大单/大单/中单/小单 <b>当日累计净额</b>（单位元，页面换算成亿元）。<br>
+     主机优先级 push2delay → push2his → push2test → push2（实测只有 push2delay 有分钟档）。<br>
+     本机与公司网络出口均直连不了 push2 系，所以取数放在 GitHub Actions 上跑，页面读静态 JSON。<br>
+     <span style="color:var(--tx3)">不构成任何投资建议；不同数据源"主力"阈值不同，禁止跨源相减。</span>`;
+}
+
+function toggleLog(){
+  const b=document.getElementById('logbox');
+  b.style.display = b.style.display==='none'?'block':'none';
+}
+
+(async function(){
+  try{
+    const r = await fetch('data.json?t='+Date.now(), {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    render(await r.json());
+  }catch(e){
+    document.getElementById('warn').innerHTML =
+      `<div class="note"><b>data.json 读不到</b><br>${esc(e.message)}<br>
+       首次部署后要等第一次 Actions 跑完才会生成这个文件。</div>`;
+  }
+})();
+setInterval(()=>location.reload(), 60000);
+</script>
+</body>
+</html>
